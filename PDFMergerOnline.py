@@ -2,8 +2,8 @@ import streamlit as st
 from pypdf import PdfWriter, PdfReader
 import io
 
-st.set_page_config(page_title="Pro PDF Merger", page_icon="📄", layout="centered")
-st.title("📄 Pro PDF Joiner & Ranger")
+st.set_page_config(page_title="Levons PDF Merger", page_icon="📄", layout="centered")
+st.title("📄 Levons PDF Merger")
 st.write("Upload your PDFs, set custom page ranges, and merge them securely.")
 
 # 1. File Upload Component
@@ -46,6 +46,14 @@ if uploaded_files:
         pdf_configs.append({"file": file, "range_str": page_range})
 
     st.markdown("---")
+    st.subheader("Final Output Settings")
+
+    #custom userdefined filename
+    custom_filename = st.text_input("Name your merged PDF file:", value ="combined_document")
+
+    #make sure they added pdf, if not we add it for them
+    if not custom_filename.endswith(".pdf"):
+        custom_filename+=".pdf"
     
     # 2. Merge Action Button
     if st.button("Merge & Download PDF", type="primary"):
@@ -56,8 +64,7 @@ if uploaded_files:
             for config in pdf_configs:
                 # Read file directly from browser memory buffer
                 file_bytes = config["file"].read()
-                pdf_reader = io.BytesIO(file_bytes)
-                
+                pdf_reader = io.BytesIO(file_bytes)                
                 page_list = parse_range(config["range_str"])
                 
                 if page_list == "Error":
@@ -83,9 +90,11 @@ if uploaded_files:
                 output_pdf.seek(0)
                 
                 st.success("🎉 Merging complete!")
+
+
                 st.download_button(
                     label="⬇️ Download Combined PDF",
                     data=output_pdf,
-                    file_name="combined_document.pdf",
+                    file_name=custom_filename,
                     mime="application/pdf"
                 )
