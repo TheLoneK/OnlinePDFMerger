@@ -1,93 +1,59 @@
-"""Streamlit app for merging PDFs with optional per-file page ranges."""
+"""Streamlit app with a few PDF tools: merge, add a password, remove a password.
 
-import io
+The PDF logic lives in pdf_tools.py; this file is only the UI.
+(The file keeps its original name because the Streamlit deployment points at it.)
+"""
+
+from pathlib import Path
 
 import streamlit as st
-from pypdf import PdfReader, PdfWriter
 
-DEFAULT_FILENAME = "combined_document"
-
-
-def parse_range(range_str: str, page_count: int) -> list[int] | None:
-    """Convert a 1-based range string like "1-3, 5" into 0-based page indices.
-
-    Returns None for a blank string (meaning all pages).
-    Raises ValueError for malformed or out-of-bounds input.
-    """
-    if not range_str.strip():
-        return None
-
-    pages: list[int] = []
-    for part in range_str.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        start_str, sep, end_str = part.partition("-")
-        try:
-            start = int(start_str)
-            end = int(end_str) if sep else start
-        except ValueError:
-            raise ValueError(f"'{part}' is not a page number or range") from None
-
-        if start < 1 or end > page_count or start > end:
-            raise ValueError(f"'{part}' is outside 1-{page_count}")
-        pages.extend(range(start - 1, end))
-
-    if not pages:
-        raise ValueError("no pages selected")
-    return pages
+from pdf_tools import (
+    ALGORITHMS,
+    DEFAULT_ALGORITHM,
+    DEFAULT_FILENAME,
+    PERMISSION_LABELS,
+    PdfToolError,
+    PermissionSet,
+    build_filename,
+    decrypt_pdf,
+    encrypt_pdf,
+    inspect_pdf,
+    merge_pdfs,
+)
 
 
-def build_filename(name: str) -> str:
-    """Return a safe download name that ends in .pdf."""
-    name = name.strip().replace("/", "_").replace("\\", "_") or DEFAULT_FILENAME
-    if not name.lower().endswith(".pdf"):
-        name += ".pdf"
-    return name
+def stem(file_name: str) -> str:
+    return Path(file_name).stem
 
 
-def merge_pdfs(configs: list[tuple]) -> io.BytesIO:
-    """Merge (uploaded_file, range_str) pairs into a single PDF buffer.
-
-    Raises ValueError with a user-facing message on the first failure.
-    """
-    writer = PdfWriter()
+def show_file_status(uploaded) -> None:
+    """Tell the user whether the uploaded PDF is already protected."""
     try:
-        for file, range_str in configs:
-            try:
-                reader = PdfReader(io.BytesIO(file.getvalue()))
-            except Exception as e:
-                raise ValueError(f"Could not read {file.name}: {e}") from e
-
-            try:
-                pages = parse_range(range_str, len(reader.pages))
-            except ValueError as e:
-                raise ValueError(f"Invalid page range for {file.name}: {e}") from e
-
-            try:
-                writer.append(reader, pages=pages)
-            except Exception as e:
-                raise ValueError(f"Error processing {file.name}: {e}") from e
-
-        output = io.BytesIO()
-        writer.write(output)
-    finally:
-        writer.close()
-
-    output.seek(0)
-    return output
+        info = inspect_pdf(uploaded.getvalue())
+    except PdfToolError as e:
+        st.error(str(e))
+        return
+    if info.needs_password:
+        st.info("🔒 This PDF needs a password to open.")
+    elif info.encrypted and info.restricted:
+        st.info("🔒 This PDF opens without a password but has permission restrictions.")
+    elif info.encrypted:
+        st.info("🔒 This PDF is encrypted.")
+    else:
+        st.caption("This PDF is not password protected.")
 
 
-st.set_page_config(page_title="Levon's PDF Merger", page_icon="📄", layout="centered")
-st.title("📄 Levon's PDF Merger")
-st.write("Upload your PDFs, set custom page ranges, and merge them securely.")
+def merge_tab() -> None:
+    st.write("Upload your PDFs, set custom page ranges, and merge them.")
+    uploaded_files = st.file_uploader(
+        "Choose PDF files", type="pdf", accept_multiple_files=True, key="merge_files"
+    )
+    if not uploaded_files:
+        return
 
-uploaded_files = st.file_uploader("Choose PDF files", type="pdf", accept_multiple_files=True)
-
-if uploaded_files:
     st.subheader("Configure Your PDFs")
-
-    pdf_configs = []
+    configs = []
     for i, file in enumerate(uploaded_files, start=1):
         col1, col2 = st.columns([3, 2])
         with col1:
@@ -98,24 +64,133 @@ if uploaded_files:
                 key=f"range_{i}",
                 placeholder="Leave blank for ALL",
             )
-        pdf_configs.append((file, page_range))
+        configs.append((file.name, file.getvalue(), page_range))
 
     st.divider()
     st.subheader("Final Output Settings")
-
-    filename = build_filename(st.text_input("Name your merged PDF file:", value=DEFAULT_FILENAME))
+    filename = build_filename(
+        st.text_input("Name your merged PDF file:", value=DEFAULT_FILENAME, key="merge_name")
+    )
 
     if st.button("Merge & Download PDF", type="primary"):
         with st.spinner("Processing your PDFs..."):
             try:
-                merged_pdf = merge_pdfs(pdf_configs)
-            except ValueError as e:
+                merged = merge_pdfs(configs)
+            except PdfToolError as e:
                 st.error(str(e))
             else:
                 st.success("🎉 Merging complete!")
                 st.download_button(
                     label="⬇️ Download Combined PDF",
-                    data=merged_pdf,
+                    data=merged,
                     file_name=filename,
                     mime="application/pdf",
                 )
+
+
+def add_password_tab() -> None:
+    st.write("Lock a PDF so it needs a password to open.")
+    uploaded = st.file_uploader("Choose a PDF", type="pdf", key="lock_file")
+    if not uploaded:
+        return
+    show_file_status(uploaded)
+
+    open_pw = st.text_input("Open password", type="password", key="lock_pw")
+    confirm_pw = st.text_input("Confirm open password", type="password", key="lock_pw_confirm")
+
+    with st.expander("Advanced: restrict what readers can do"):
+        st.caption(
+            "Restrictions only hold if you set a separate permissions password. "
+            "Anyone with the permissions password gets full access. Note that "
+            "restrictions are honoured by well-behaved PDF readers but aren't real "
+            "protection on their own; the open password is what keeps content private."
+        )
+        perms_pw = st.text_input("Permissions password (optional)", type="password", key="lock_owner_pw")
+        st.markdown("**Allow readers to:**")
+        cols = st.columns(2)
+        allowed = {
+            name: cols[i % 2].checkbox(label, value=True, key=f"perm_{name}")
+            for i, (name, label) in enumerate(PERMISSION_LABELS.items())
+        }
+        algorithm = st.selectbox(
+            "Encryption", list(ALGORITHMS), index=list(ALGORITHMS).index(DEFAULT_ALGORITHM)
+        )
+
+    permissions = PermissionSet(**allowed)
+    if permissions.restricted and not perms_pw:
+        st.warning("You've set restrictions without a permissions password, so they won't take effect.")
+
+    filename = build_filename(
+        st.text_input("Name the protected file:", value=f"{stem(uploaded.name)}_protected", key="lock_name")
+    )
+
+    if st.button("Add Password", type="primary"):
+        if open_pw != confirm_pw:
+            st.error("The open passwords don't match.")
+            return
+        if not open_pw and not perms_pw:
+            st.error("Enter an open password.")
+            return
+        with st.spinner("Encrypting..."):
+            try:
+                locked = encrypt_pdf(uploaded.getvalue(), open_pw, perms_pw, permissions, algorithm)
+            except PdfToolError as e:
+                st.error(str(e))
+                return
+        st.success("🔒 Password added. Keep the password somewhere safe; it can't be recovered.")
+        st.download_button(
+            label="⬇️ Download Protected PDF",
+            data=locked,
+            file_name=filename,
+            mime="application/pdf",
+        )
+
+
+def remove_password_tab() -> None:
+    st.write(
+        "Save an unlocked copy of a PDF you have the password for. "
+        "The correct password is required; this tool can't bypass or recover one."
+    )
+    uploaded = st.file_uploader("Choose a protected PDF", type="pdf", key="unlock_file")
+    if not uploaded:
+        return
+    show_file_status(uploaded)
+
+    password = st.text_input(
+        "Password",
+        type="password",
+        key="unlock_pw",
+        help="The open password. If the file has editing or printing restrictions, "
+        "use its permissions password instead.",
+    )
+    filename = build_filename(
+        st.text_input("Name the unlocked file:", value=f"{stem(uploaded.name)}_unlocked", key="unlock_name")
+    )
+
+    if st.button("Remove Password", type="primary"):
+        with st.spinner("Unlocking..."):
+            try:
+                unlocked = decrypt_pdf(uploaded.getvalue(), password)
+            except PdfToolError as e:
+                st.error(str(e))
+                return
+        st.success("🔓 Password removed.")
+        st.download_button(
+            label="⬇️ Download Unlocked PDF",
+            data=unlocked,
+            file_name=filename,
+            mime="application/pdf",
+        )
+
+
+st.set_page_config(page_title="Levon's PDF Tools", page_icon="📄", layout="centered")
+st.title("📄 Levon's PDF Tools")
+st.caption("Files are processed in memory and never saved on the server.")
+
+merge, add_pw, remove_pw = st.tabs(["Merge PDFs", "Add Password", "Remove Password"])
+with merge:
+    merge_tab()
+with add_pw:
+    add_password_tab()
+with remove_pw:
+    remove_password_tab()
